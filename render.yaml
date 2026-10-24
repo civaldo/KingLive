@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: kinglive-tiktok-bridge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r bridge/requirements.txt
+    startCommand: gunicorn --chdir bridge --bind 0.0.0.0:$PORT server:app
+    envVars:
+      - key: TIKTOK_UNIQUE_ID
+        sync: false
+      - key: KINGLIVE_DEFAULT_TEAM
+        value: lions
