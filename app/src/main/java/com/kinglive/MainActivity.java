@@ -8,6 +8,16 @@ import android.graphics.drawable.GradientDrawable;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.EditText;
+import android.os.Handler;
+import android.os.Looper;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
@@ -19,6 +29,10 @@ public class MainActivity extends Activity {
     private TextView lionScore, dragonScore, status, eventLog, battleStatus;
     private ProgressBar lionBar, dragonBar;
     private LinearLayout root;
+    private EditText bridgeUrlInput, tiktokUserInput;
+    private volatile boolean bridgeRunning = false;
+    private long lastEventId = 0;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private final int bg = Color.rgb(12, 15, 31);
     private final int gold = Color.rgb(255, 197, 65);
@@ -126,11 +140,16 @@ public class MainActivity extends Activity {
         TextView connectionTitle = text("🔌  INTEGRAÇÃO TIKTOK LIVE", 14, Color.rgb(116, 235, 199), true);
         connectionTitle.setGravity(Gravity.LEFT);
         connection.addView(connectionTitle, params(-1, -2));
-        TextView connectionBody = text("Status: ainda não conectada. Para receber comentários e presentes reais, o app precisará de um serviço de integração seguro. Os botões acima são apenas testes.", 13, Color.rgb(209, 222, 230), false);
+        TextView connectionBody = text("Configure a URL HTTPS da ponte publicada e o @ do perfil que está ao vivo. Comentário real: +1. Presente real: +5 por unidade. Comentários com LEÃO/DRAGÃO escolhem a equipe; os demais e os presentes vão para a equipe padrão configurada na ponte.", 13, Color.rgb(209, 222, 230), false);
         connectionBody.setGravity(Gravity.LEFT);
-        connectionBody.setPadding(0, dp(8), 0, 0);
+        connectionBody.setPadding(0, dp(8), 0, dp(8));
         connection.addView(connectionBody, params(-1, -2));
+        bridgeUrlInput = editField("https://sua-ponte.onrender.com", "URL HTTPS da ponte");
+        tiktokUserInput = editField("@seuperfil", "@ do perfil que está ao vivo");
+        connection.addView(bridgeUrlInput, params(-1, dp(52)));
+        connection.addView(tiktokUserInput, params(-1, dp(52)));
         root.addView(connection, params(-1, -2));
+        addButton("🔗  Conectar ao TikTok LIVE", Color.rgb(16, 126, 101), v -> connectBridge());
         addSpace(14);
 
         eventLog = text("📣  Último evento: nenhum", 12, muted, false);
@@ -155,6 +174,103 @@ public class MainActivity extends Activity {
         TextView label = text(name, 13, Color.WHITE, true);
         panel.addView(label, params(-1, -2));
         return panel;
+    }
+
+    private EditText editField(String hint, String description) {
+        EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setHint(hint);
+        input.setTextColor(Color.WHITE);
+        input.setHintTextColor(muted);
+        input.setTextSize(14);
+        input.setPadding(dp(10), dp(4), dp(10), dp(4));
+        input.setBackground(round(Color.rgb(29, 39, 55), 10, Color.rgb(66, 88, 112)));
+        input.setContentDescription(description);
+        LinearLayout.LayoutParams p = params(-1, dp(52));
+        p.setMargins(0, dp(3), 0, dp(3));
+        return input;
+    }
+
+    private void connectBridge() {
+        final String base = bridgeUrlInput.getText().toString().trim().replaceAll("/+$", "");
+        final String username = tiktokUserInput.getText().toString().trim().replace("@", "");
+        if (!base.startsWith("https://") || username.isEmpty()) {
+            eventLog.setText("📣 Informe a URL HTTPS da ponte e o @ do perfil.");
+            return;
+        }
+        if (bridgeRunning) {
+            bridgeRunning = false;
+            eventLog.setText("📣 Desconectando a leitura no aplicativo…");
+            return;
+        }
+        bridgeRunning = true;
+        eventLog.setText("📣 Conectando à ponte…");
+        Thread worker = new Thread(() -> {
+            try {
+                JSONObject initial = requestJson("GET", base + "/api/events?since=0", null);
+                lastEventId = initial.optLong("latest_id", 0);
+                JSONObject body = new JSONObject();
+                body.put("username", username);
+                requestJson("POST", base + "/api/connect", body);
+                mainHandler.post(() -> eventLog.setText("📣 Ponte acionada. Aguardando eventos reais…"));
+                while (bridgeRunning) {
+                    JSONObject response = requestJson("GET", base + "/api/events?since=" + lastEventId, null);
+                    JSONArray events = response.optJSONArray("events");
+                    if (events != null) {
+                        for (int i = 0; i < events.length(); i++) {
+                            JSONObject event = events.optJSONObject(i);
+                            if (event == null) continue;
+                            lastEventId = Math.max(lastEventId, event.optLong("id", lastEventId));
+                            final String type = event.optString("type", "");
+                            final String team = event.optString("team", "lions");
+                            final int points = event.optInt("points", 0);
+                            final String details = event.optString("details", type);
+                            mainHandler.post(() -> {
+                                if ("comment".equals(type) || "gift".equals(type)) {
+                                    if ("dragons".equals(team)) dragons += points;
+                                    else lions += points;
+                                    update(details + " (+" + points + " pontos)");
+                                } else {
+                                    eventLog.setText("📣 " + details);
+                                }
+                            });
+                        }
+                    }
+                    Thread.sleep(1800);
+                }
+            } catch (Exception e) {
+                mainHandler.post(() -> eventLog.setText("📣 Erro na ponte: " + e.getMessage()));
+            } finally {
+                bridgeRunning = false;
+            }
+        });
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private JSONObject requestJson(String method, String address, JSONObject body) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(address).openConnection();
+        connection.setRequestMethod(method);
+        connection.setConnectTimeout(10000);
+        connection.setReadTimeout(10000);
+        connection.setRequestProperty("Accept", "application/json");
+        if (body != null) {
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            try (OutputStream out = connection.getOutputStream()) {
+                out.write(body.toString().getBytes("UTF-8"));
+            }
+        }
+        int code = connection.getResponseCode();
+        java.io.InputStream stream = code >= 200 && code < 300 ? connection.getInputStream() : connection.getErrorStream();
+        StringBuilder result = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, "UTF-8"))) {
+            String line;
+            while ((line = reader.readLine()) != null) result.append(line);
+        }
+        connection.disconnect();
+        if (code < 200 || code >= 300) throw new Exception("HTTP " + code + ": " + result);
+        return new JSONObject(result.toString());
     }
 
     private TextView text(String value, int size, int color, boolean bold) {
